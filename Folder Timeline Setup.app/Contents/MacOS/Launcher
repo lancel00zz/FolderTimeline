@@ -1,0 +1,23 @@
+#!/bin/bash
+# ──────────────────────────────────────────────────────────────────────────────
+#  Folder Timeline — Launcher
+#  Finds setup.command next to this .app, writes a temp script in /tmp
+#  (no spaces in path), and opens it in Terminal.
+# ──────────────────────────────────────────────────────────────────────────────
+
+BUNDLE_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+PARENT_DIR="$(dirname "$BUNDLE_DIR")"
+SETUP_SCRIPT="$PARENT_DIR/setup.command"
+
+if [[ ! -f "$SETUP_SCRIPT" ]]; then
+    osascript -e 'display alert "Setup script not found" message "Keep Folder Timeline Setup.app in the same folder as setup.command, then try again." as warning'
+    exit 1
+fi
+
+chmod +x "$SETUP_SCRIPT"
+
+TEMP=$(mktemp /tmp/ft_setup_XXXX.command)
+printf '#!/bin/bash\nexec bash %q\n' "$SETUP_SCRIPT" > "$TEMP"
+chmod +x "$TEMP"
+
+open -a Terminal "$TEMP"
