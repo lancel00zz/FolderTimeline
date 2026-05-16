@@ -1,0 +1,20 @@
+# Distribution archives
+*.zip
+*.tar.gz
+ 
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+__MACOSX/
+ 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+ 
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
