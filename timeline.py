@@ -26,6 +26,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 _MISSING = object()  # sentinel for unset thumbnail cache entries
 
+VERSION = '2.0'
+
 # ── Date parsing ──────────────────────────────────────────────────────────────
 
 _RE_FULL  = re.compile(r'^(\d{4})[.\-](\d{2})[.\-](\d{2})')
@@ -633,7 +635,7 @@ def _generate_html(folder: str, title: str, items: list[dict], port: int) -> str
   <span><span class="ldot" style="background:#632CA6"></span>File</span>
   <span><span class="ldot" style="background:#2D9CDB"></span>Folder</span>
 </div>
-<footer>Click any item to open.&nbsp; This view was generated on {generated}.</footer>
+<footer>Click any item to open.&nbsp; This view was generated on {generated}.&nbsp;&nbsp; FolderTimeline v{VERSION}</footer>
 <div id="callout"></div>
 <div id="preview-float"><img src="" alt="preview"></div>
 
@@ -973,10 +975,7 @@ function renderChart() {{
   groups.forEach((items, key) => {{
     const cx    = scale.xOf(granCenter(key, gran));
     const x     = cx - BAR / 2;
-    const units = [
-      ...items.filter(it => !it.is_dir),
-      ...items.filter(it =>  it.is_dir),
-    ];
+    const units = items; // date order preserved from groupItems()
 
     units.forEach((item, idx) => {{
       const n    = idx + 1;
