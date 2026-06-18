@@ -24,6 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
+_MISSING = object()  # sentinel for unset thumbnail cache entries
 
 # ── Date parsing ──────────────────────────────────────────────────────────────
 
@@ -122,7 +123,7 @@ class _Handler(BaseHTTPRequestHandler):
             path = unquote(raw)
             real = os.path.realpath(path)
             root = os.path.realpath(self.server.allowed_root)
-            if '..' in path or not (real == root or real.startswith(root + os.sep)):
+            if not (real == root or real.startswith(root + os.sep)):
                 return self._reply(403, 'forbidden')
             # Open file or folder with its default application.
             # Using plain `open` avoids any Accessibility permission requirements.
@@ -136,7 +137,7 @@ class _Handler(BaseHTTPRequestHandler):
             path = unquote(raw)
             real = os.path.realpath(path)
             root = os.path.realpath(self.server.allowed_root)
-            if '..' in path or not (real == root or real.startswith(root + os.sep)):
+            if not (real == root or real.startswith(root + os.sep)):
                 return self._reply(403, 'forbidden')
             if os.path.isdir(path):
                 return self._reply(404, 'no thumb for dirs')
@@ -157,6 +158,18 @@ class _Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=close_fn, daemon=True).start()
             else:
                 threading.Thread(target=self.server._stop, daemon=True).start()
+
+        elif parsed.path == '/minimize':
+            self._reply(200, 'ok')
+            fn = getattr(self.server, '_minimize_window', None)
+            if fn:
+                threading.Thread(target=fn, daemon=True).start()
+
+        elif parsed.path == '/fullscreen':
+            self._reply(200, 'ok')
+            fn = getattr(self.server, '_fullscreen_window', None)
+            if fn:
+                threading.Thread(target=fn, daemon=True).start()
 
         elif parsed.path == '/shutdown':
             self._reply(200, 'ok')
@@ -179,7 +192,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class _Server:
-    IDLE = 60  # seconds of inactivity before self-shutdown
+    IDLE = 300  # seconds of inactivity before self-shutdown
 
     def __init__(self, folder: str, allowed_root: str | None = None):
         self.folder       = folder
@@ -207,13 +220,34 @@ class _Server:
         self._done.set()
 
     def get_thumb(self, path: str) -> bytes | None:
-        """Return cached PNG bytes for path, generating on first call."""
+        """Return cached PNG bytes for path, generating on first call.
+
+        Thread-safe: the first caller generates the thumbnail; concurrent
+        callers block on an Event and share the result instead of racing.
+        """
         with self._thumb_lock:
-            if path in self._thumb_cache:
-                return self._thumb_cache[path]
+            entry = self._thumb_cache.get(path, _MISSING)
+            if entry is _MISSING:
+                evt = threading.Event()
+                self._thumb_cache[path] = evt   # reserve the slot
+                generate = True
+            elif isinstance(entry, threading.Event):
+                evt = entry
+                generate = False
+            else:
+                return entry                    # bytes or None (no thumb)
+
+        if not generate:
+            evt.wait(timeout=15)
+            with self._thumb_lock:
+                result = self._thumb_cache.get(path, _MISSING)
+            return None if (result is _MISSING or isinstance(result, threading.Event)) else result
+
         thumb = _make_thumb(path)
         with self._thumb_lock:
-            self._thumb_cache[path] = thumb   # cache None too (avoids retry)
+            stored_evt = self._thumb_cache[path]
+            self._thumb_cache[path] = thumb
+        stored_evt.set()
         return thumb
 
     def prefetch_thumbs(self, items: list) -> None:
@@ -292,6 +326,29 @@ def _generate_html(folder: str, title: str, items: list[dict], port: int) -> str
     -webkit-app-region: drag;
     z-index: 200;
   }}
+  /* macOS traffic-light window buttons */
+  #wm-buttons {{
+    position: fixed;
+    top: 8px; left: 12px;
+    display: flex; gap: 8px;
+    z-index: 201;
+    -webkit-app-region: no-drag;
+  }}
+  #wm-buttons button {{
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    border: 0.5px solid rgba(0,0,0,.15);
+    padding: 0; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0;
+  }}
+  #btn-close      {{ background: #FF5F57; }}
+  #btn-minimize   {{ background: #FFBD2E; }}
+  #btn-fullscreen {{ background: #28C840; }}
+  #wm-buttons:hover button {{ font-size: 8px; font-weight: 900; color: rgba(0,0,0,.5); line-height: 1; }}
+  #wm-buttons:hover #btn-close::before      {{ content: '✕'; }}
+  #wm-buttons:hover #btn-minimize::before   {{ content: '−'; }}
+  #wm-buttons:hover #btn-fullscreen::before {{ content: '+'; }}
   body {{
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: #fff;
@@ -551,6 +608,11 @@ def _generate_html(folder: str, title: str, items: list[dict], port: int) -> str
 </head>
 <body>
 <div id="drag-strip"></div>
+<div id="wm-buttons">
+  <button id="btn-close"      title="Close"       onclick="fetch('http://127.0.0.1:{port}/close').catch(()=>{{}})"></button>
+  <button id="btn-minimize"   title="Minimize"    onclick="fetch('http://127.0.0.1:{port}/minimize').catch(()=>{{}})"></button>
+  <button id="btn-fullscreen" title="Fullscreen"  onclick="fetch('http://127.0.0.1:{port}/fullscreen').catch(()=>{{}})"></button>
+</div>
 <p class="path">{folder}</p>
 <h1 id="timeline-title">Timeline \u2014 {items_count} {item_word} \u2014 {folder_label}</h1>
 <div id="controls-row">
@@ -686,6 +748,14 @@ function renderChart() {{
   const svg  = document.createElementNS(NS, 'svg');
   svg.id     = 'chart';
   svg.style.display = 'block';
+
+  // Folder icon symbol — referenced by <use> inside directory bars.
+  const _defs = document.createElementNS(NS, 'defs');
+  const _sym  = document.createElementNS(NS, 'symbol');
+  _sym.id = 'icon-folder'; _sym.setAttribute('viewBox', '0 0 24 24');
+  const _ip = document.createElementNS(NS, 'path');
+  _ip.setAttribute('d', 'M2 7C2 5.9 2.9 5 4 5L9.5 5L11.5 7L20 7C21.1 7 22 7.9 22 9L22 18C22 19.1 21.1 20 20 20L4 20C2.9 20 2 19.1 2 18Z');
+  _sym.appendChild(_ip); _defs.appendChild(_sym); svg.appendChild(_defs);
 
   const g = svgEl('g', {{ transform: `translate(${{M.left}},${{M.top}})` }});
   svg.appendChild(g);
@@ -917,6 +987,15 @@ function renderChart() {{
         x, y: barY, width: BAR, height: barH,
         rx: 2, class: item.is_dir ? 'bar-dir' : 'bar-file',
       }}));
+
+      if (item.is_dir && barH >= 14 && BAR >= 12) {{
+        const ic = Math.min(BAR * 0.68, barH * 0.68, 18);
+        g.appendChild(svgEl('use', {{
+          href: '#icon-folder',
+          x: x + (BAR - ic) / 2, y: barY + (barH - ic) / 2,
+          width: ic, height: ic, fill: 'rgba(255,255,255,0.75)',
+        }}));
+      }}
 
       const hz = svgEl('rect', {{
         x: x - 4, y: barY, width: BAR + 8, height: barH, class: 'bar-hover',
@@ -1272,9 +1351,11 @@ def _open_with_pywebview(folder_name: str, url: str, server: '_Server') -> None:
     # Stop the HTTP server when the native window is closed
     window.events.closed += server._stop
 
-    # Expose window.destroy() to the HTTP handler so JS can trigger a real close
-    # via GET /close (window.close() is blocked by WKWebView).
-    server._httpd._close_window = window.destroy
+    # Expose window controls to the HTTP handler so JS buttons can drive the
+    # native window (WKWebView blocks window.close() / window.minimize() directly).
+    server._httpd._close_window    = window.destroy
+    server._httpd._minimize_window  = window.minimize
+    server._httpd._fullscreen_window = window.toggle_fullscreen
 
     # webview.start() takes over the main thread as the UI run loop.
     # It returns only after the window is closed.
